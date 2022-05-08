@@ -1,6 +1,8 @@
 package icmp6
 
 import (
+	"fmt"
+
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv6"
 )
@@ -20,7 +22,15 @@ func ParseMessage(proto int, b []byte) (*icmp.Message, error) {
 	var err2 error
 	switch m.Type {
 	case ipv6.ICMPTypeNeighborSolicitation:
-		mb, err2 = parseNeighborSolicitation(m.Type.(ipv6.ICMPType), rb.Data)
+		mb, err2 = parseNeighborSolicitation(rb.Data)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to parse neighbor solicitation: %s", err2)
+		}
+	case ipv6.ICMPTypeNeighborAdvertisement:
+		mb, err2 = parseNeighborAdvertisement(rb.Data)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to parse neighbor advertisement: %w", err2)
+		}
 	case ipv6.ICMPTypeMulticastListenerQuery:
 		fallthrough
 	case ipv6.ICMPTypeMulticastListenerReport:
