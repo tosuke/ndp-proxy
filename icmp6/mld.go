@@ -358,6 +358,9 @@ func parseMLDMessage(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 		// ICMPv6 MLDv1 Query Message(28 bytes) - ICMPv6 Header(8 bytes)
 		if len(b) != 20 {
 			mb, err := parseMLDv2Query(typ, b)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse version 2 multicast listener query: %w", err)
+			}
 			return mb, err
 		}
 		fallthrough
@@ -365,9 +368,15 @@ func parseMLDMessage(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 		fallthrough
 	case ipv6.ICMPTypeMulticastListenerDone:
 		mb, err := parseMLDv1Message(typ, b)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse multicast listener message: %w", err)
+		}
 		return mb, err
 	case ipv6.ICMPTypeVersion2MulticastListenerReport:
 		mb, err := parseMLDv2Report(b)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse version 2 multicast listener report: %w", err)
+		}
 		return mb, err
 	default:
 		return nil, fmt.Errorf("unknown message type(%s)", typ.String())
