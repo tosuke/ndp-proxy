@@ -13,7 +13,7 @@ import (
 
 type mldV1Message struct {
 	MaximumResponseDelay uint16
-	MulticastAddress     netip.Addr
+	MulticastAddr        netip.Addr
 }
 
 var _ icmp.MessageBody = (*mldV1Message)(nil)
@@ -31,7 +31,7 @@ func (mldm *mldV1Message) Marshal(proto int) ([]byte, error) {
 
 	b := make([]byte, mldm.Len(proto))
 	binary.BigEndian.PutUint16(b[0:2], mldm.MaximumResponseDelay)
-	copy(b[4:], mldm.MulticastAddress.AsSlice())
+	copy(b[4:], mldm.MulticastAddr.AsSlice())
 	return b, nil
 }
 
@@ -52,21 +52,16 @@ func parseMLDv1Message(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 		return nil, errors.New("invalid payload length")
 	}
 
-	maximumResponseDelay := binary.BigEndian.Uint16(b[0:2])
+	maxRespDelay := binary.BigEndian.Uint16(b[0:2])
 
-	reserved := binary.BigEndian.Uint16(b[2:4])
-	if reserved != 0 {
-		return nil, errors.New("invalid reserved field")
-	}
-
-	multicastAddress, err := unmarshalIPv6MulticastAddress(b[4:20])
+	maddr, err := unmarshalIPv6MulticastAddress(b[4:20])
 	if err != nil {
 		return nil, err
 	}
 
 	m := mldV1Message{
-		MaximumResponseDelay: maximumResponseDelay,
-		MulticastAddress:     multicastAddress,
+		MaximumResponseDelay: maxRespDelay,
+		MulticastAddr:        maddr,
 	}
 
 	switch typ {
@@ -90,17 +85,17 @@ func parseMLDv1Message(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 
 type MulticastListenerQueryVersion2 struct {
 	MaximumResponseDelay        uint
-	MulticastAddress            netip.Addr
+	MulticastAddr               netip.Addr
 	SupressRouterSideProcessing bool
 	Robustness                  uint // Querier's Robustness Variable
 	QueryInterval               uint // Quewier's Query Interval
-	SourceAddresses             []netip.Addr
+	SourceAddrs                 []netip.Addr
 }
 
 var _ icmp.MessageBody = (*MulticastListenerQueryVersion2)(nil)
 
 func (m *MulticastListenerQueryVersion2) Len(proto int) int {
-	return 4 + 16 + 4 + 16*len(m.SourceAddresses)
+	return 4 + 16 + 4 + 16*len(m.SourceAddrs)
 }
 
 func (m *MulticastListenerQueryVersion2) Marshal(proto int) ([]byte, error) {
@@ -136,15 +131,15 @@ func (m *MulticastListenerQueryVersion2) Marshal(proto int) ([]byte, error) {
 	}
 	binary.BigEndian.PutUint16(b[0:2], maxRespCode)
 
-	if !m.MulticastAddress.Is6() {
-		return nil, fmt.Errorf("multicast address %v is not IPv6", m.MulticastAddress)
+	if !m.MulticastAddr.Is6() {
+		return nil, fmt.Errorf("multicast address %v is not IPv6", m.MulticastAddr)
 	}
-	if !m.MulticastAddress.IsMulticast() {
-		return nil, fmt.Errorf("address %v is not multicast", m.MulticastAddress)
+	if !m.MulticastAddr.IsMulticast() {
+		return nil, fmt.Errorf("address %v is not multicast", m.MulticastAddr)
 	}
-	maddrBytes, err := m.MulticastAddress.MarshalBinary()
+	maddrBytes, err := m.MulticastAddr.MarshalBinary()
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal multicast address(%v): %w", m.MulticastAddress, err)
+		return nil, fmt.Errorf("failed to marshal multicast address(%v): %w", m.MulticastAddr, err)
 	}
 	copy(b[4:20], maddrBytes)
 
@@ -180,12 +175,12 @@ func (m *MulticastListenerQueryVersion2) Marshal(proto int) ([]byte, error) {
 	}
 	b[21] = qqic
 
-	if len(m.SourceAddresses) > 65536 {
+	if len(m.SourceAddrs) > 65536 {
 		return nil, errors.New("too many source addresses")
 	}
-	binary.BigEndian.PutUint16(b[22:24], uint16(len(m.SourceAddresses)))
+	binary.BigEndian.PutUint16(b[22:24], uint16(len(m.SourceAddrs)))
 
-	for i, addr := range m.SourceAddresses {
+	for i, addr := range m.SourceAddrs {
 		if !addr.Is6() {
 			return nil, fmt.Errorf("source address %v is not IPv address", addr)
 		}
@@ -252,11 +247,11 @@ func parseMLDv2Query(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 
 	return &MulticastListenerQueryVersion2{
 		MaximumResponseDelay:        maxRespDelay,
-		MulticastAddress:            maddr,
+		MulticastAddr:               maddr,
 		SupressRouterSideProcessing: sFlag,
 		Robustness:                  robustness,
 		QueryInterval:               qqi,
-		SourceAddresses:             sources,
+		SourceAddrs:                 sources,
 	}, nil
 }
 

@@ -88,7 +88,7 @@ type NeighborAdvertisement struct {
 	RouterFlag    bool
 	SolicitedFlag bool
 	OverrideFlag  bool
-	TargetAddress netip.Addr
+	TargetAddr    netip.Addr
 	Options       NDPOptions
 }
 
@@ -123,10 +123,10 @@ func (na *NeighborAdvertisement) Marshal(proto int) ([]byte, error) {
 	}
 	b[0] = b0
 
-	if na.TargetAddress.IsMulticast() {
+	if na.TargetAddr.IsMulticast() {
 		return nil, errors.New("target address must not be multicast")
 	}
-	addrBytes, err := na.TargetAddress.MarshalBinary()
+	addrBytes, err := na.TargetAddr.MarshalBinary()
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal target address: %w", err)
 	}
@@ -178,7 +178,7 @@ func parseNeighborAdvertisement(b []byte) (icmp.MessageBody, error) {
 		RouterFlag:    routerFlag,
 		SolicitedFlag: solicitedFlag,
 		OverrideFlag:  overrideFlag,
-		TargetAddress: targetAddr,
+		TargetAddr:    targetAddr,
 		Options:       options,
 	}, nil
 }
