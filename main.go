@@ -90,12 +90,18 @@ func main() {
 }
 
 func listenMLD(ctx context.Context, ifi *net.Interface, querier bool, ac AddrCollector) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	lc := &net.ListenConfig{}
 	c, err := lc.ListenPacket(ctx, "ip6:ipv6-icmp", "::")
 	if err != nil {
 		return fmt.Errorf("failed to listen ICMP6: %w", err)
 	}
-	defer c.Close()
+	go func() {
+		<-ctx.Done()
+		c.Close()
+	}()
 	p := ipv6.NewPacketConn(c)
 
 	if err := p.SetControlMessage(ipv6.FlagHopLimit|ipv6.FlagInterface, true); err != nil {
@@ -137,7 +143,7 @@ func listenMLD(ctx context.Context, ifi *net.Interface, querier bool, ac AddrCol
 			tick := time.Tick(time.Duration(interval) * time.Second)
 
 			for {
-				err := sendMLDQuery(ctx, ifi, p, interval)
+				err := sendMLDQuery(querierCtx, ifi, p, interval)
 				if err != nil {
 					log.Printf("MLD: failed to send query: %v", err)
 				}
@@ -153,86 +159,80 @@ func listenMLD(ctx context.Context, ifi *net.Interface, querier bool, ac AddrCol
 	}
 
 	eg.Go(func() error {
-		errChan := make(chan error)
-		go func() {
-			for {
-				rb := make([]byte, 1500)
-				n, rcm, srcAddr, err := p.ReadFrom(rb)
-				if err != nil {
-					errChan <- fmt.Errorf("failed to read from socket: %w", err)
+		for {
+			rb := make([]byte, 1500)
+			n, rcm, srcAddr, err := p.ReadFrom(rb)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+					return fmt.Errorf("failed to read from socket: %w", err)
+				}
+			}
+
+			go func() {
+				if rcm.IfIndex != ifi.Index {
 					return
 				}
 
-				go func() {
-					if rcm.IfIndex != ifi.Index {
+				m, err := icmp6.ParseMessage(ipv6.ICMPTypeMulticastListenerReport.Protocol(), rb[:n])
+				if err != nil {
+					log.Printf("failed to parse MLD message: %v", err)
+					return
+				}
+
+				if querier && m.Type == ipv6.ICMPTypeMulticastListenerQuery {
+					srcIP := srcAddr.(*net.IPAddr)
+					src, ok := netip.AddrFromSlice(srcIP.IP)
+					if !ok {
 						return
 					}
+					if srcIP.Zone != "" {
+						src = src.WithZone(srcIP.Zone)
+					}
 
-					m, err := icmp6.ParseMessage(ipv6.ICMPTypeMulticastListenerReport.Protocol(), rb[:n])
+					lladdr, err := findLinkLocalAddr(ifi)
 					if err != nil {
-						log.Printf("failed to parse MLD message: %v", err)
+						log.Printf("failed to find link local address: %v", err)
 						return
 					}
 
-					if querier && m.Type == ipv6.ICMPTypeMulticastListenerQuery {
-						srcIP := srcAddr.(*net.IPAddr)
-						src, ok := netip.AddrFromSlice(srcIP.IP)
-						if !ok {
-							return
-						}
-						if srcIP.Zone != "" {
-							src = src.WithZone(srcIP.Zone)
-						}
-
-						lladdr, err := findLinkLocalAddr(ifi)
-						if err != nil {
-							log.Printf("failed to find link local address: %v", err)
-							return
-						}
-
-						log.Printf("detect MLD querier on %s", src)
-						if src.Compare(lladdr) < 0 {
-							cancelQuerier()
-						}
+					log.Printf("detect MLD querier on %s", src)
+					if src.Compare(lladdr) < 0 {
+						cancelQuerier()
 					}
+				}
 
-					switch mb := m.Body.(type) {
-					case *icmp6.MulticastListenerReport:
-						if isSolicitatedNodeMulticastAddress(mb.MulticastAddr) {
-							ac.Join(mb.MulticastAddr)
+				switch mb := m.Body.(type) {
+				case *icmp6.MulticastListenerReport:
+					if isSolicitatedNodeMulticastAddress(mb.MulticastAddr) {
+						ac.Join(mb.MulticastAddr)
+					}
+				case *icmp6.MulticastListenerDone:
+					if isSolicitatedNodeMulticastAddress(mb.MulticastAddr) {
+						ac.Leave(mb.MulticastAddr)
+					}
+				case *icmp6.MulticastListenerReportVersion2:
+					for _, r := range mb.Records {
+						if !isSolicitatedNodeMulticastAddress(r.MulticastAddress) {
+							continue
 						}
-					case *icmp6.MulticastListenerDone:
-						if isSolicitatedNodeMulticastAddress(mb.MulticastAddr) {
-							ac.Leave(mb.MulticastAddr)
-						}
-					case *icmp6.MulticastListenerReportVersion2:
-						for _, r := range mb.Records {
-							if !isSolicitatedNodeMulticastAddress(r.MulticastAddress) {
-								continue
+						switch r.Type {
+						case icmp6.MulticastAddressRecordTypeModeIsExclude:
+							if len(r.SourceAddresses) == 0 {
+								ac.Join(r.MulticastAddress)
 							}
-							switch r.Type {
-							case icmp6.MulticastAddressRecordTypeModeIsExclude:
-								if len(r.SourceAddresses) == 0 {
-									ac.Join(r.MulticastAddress)
-								}
-							case icmp6.MulticastAddressRecordTypeChangeToExcludeMode:
-								if len(r.SourceAddresses) == 0 {
-									ac.Join(r.MulticastAddress)
-								}
+						case icmp6.MulticastAddressRecordTypeChangeToExcludeMode:
+							if len(r.SourceAddresses) == 0 {
+								ac.Join(r.MulticastAddress)
 							}
 						}
-					default:
-						break
 					}
-				}()
-			}
-		}()
-
-		select {
-		case err := <-errChan:
-			return err
-		case <-ctx.Done():
-			return nil
+				default:
+					break
+				}
+			}()
 		}
 	})
 

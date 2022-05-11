@@ -26,6 +26,9 @@ type request struct {
 }
 
 func (np *NDPProxy) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	if np.UpIf == nil {
 		return fmt.Errorf("no interface")
 	}
@@ -39,7 +42,10 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen ICMP6: %w", err)
 	}
-	defer c.Close()
+	go func() {
+		<-ctx.Done()
+		c.Close()
+	}()
 	p := ipv6.NewPacketConn(c)
 
 	if err := p.SetControlMessage(ipv6.FlagHopLimit|ipv6.FlagInterface, true); err != nil {
@@ -72,29 +78,23 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 	})
 
 	eg.Go(func() error {
-		errChan := make(chan error)
-		go func() {
-			for {
-				rb := make([]byte, 1500)
-				n, rcm, src, err := p.ReadFrom(rb)
-				if err != nil {
-					errChan <- fmt.Errorf("failed to read from socket: %w", err)
-					return
+		for {
+			rb := make([]byte, 1500)
+			n, rcm, src, err := p.ReadFrom(rb)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+					return fmt.Errorf("failed to read from socket: %w", err)
 				}
-
-				go func() {
-					if err := np.handle(p, rb[:n], rcm, src); err != nil {
-						log.Printf("NDP: failed to handle ICMP6 packet: %v", err)
-					}
-				}()
 			}
-		}()
 
-		select {
-		case err := <-errChan:
-			return fmt.Errorf("failed to run NDPProxy: %w", err)
-		case <-ctx.Done():
-			return nil
+			go func() {
+				if err := np.handle(p, rb[:n], rcm, src); err != nil {
+					log.Printf("NDP: failed to handle ICMP6 packet: %v", err)
+				}
+			}()
 		}
 	})
 
