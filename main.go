@@ -2,16 +2,17 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"os"
 	"os/signal"
+	"time"
 
+	flag "github.com/spf13/pflag"
 	"github.com/tosuke/ndp-proxy/icmp6"
+	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sync/errgroup"
 )
@@ -20,41 +21,77 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	var ifi *net.Interface
-	flag.Func("i", "`interface` to run NDP proxy", func(name string) (err error) {
-		ifi, err = net.InterfaceByName(name)
-		return
-	})
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] [upstream interface] [downstream interface]\n\nOptions\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 
-	var ifiMLD *net.Interface
-	flag.Func("m", "`interface` to listen MLD", func(name string) (err error) {
-		ifiMLD, err = net.InterfaceByName(name)
-		return
-	})
+	var showHelp bool
+	flag.BoolVarP(&showHelp, "help", "h", false, "show this message")
+
+	var runAsMLDQuerier bool
+	flag.BoolVarP(&runAsMLDQuerier, "mld-querier", "", false, "run as MLD querier")
 
 	flag.Parse()
 
-	if ifi == nil || ifiMLD == nil {
+	if showHelp {
 		flag.Usage()
+		os.Exit(0)
+	}
 
-		if ifi == nil {
-			fmt.Println("-i is required")
-		}
-		if ifiMLD == nil {
-			fmt.Println("-m is required")
-		}
+	args := flag.Args()
+	if len(args) != 2 {
+		flag.Usage()
 		os.Exit(1)
 	}
+
+	ifs := make([]*net.Interface, 0, len(args))
+	for _, name := range args {
+		ifi, err := net.InterfaceByName(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to find interface %s: %v\n", name, err)
+			os.Exit(1)
+		}
+		ifs = append(ifs, ifi)
+	}
+
+	upIf := ifs[0]
+	downIf := ifs[1]
 
 	joinChan := make(chan netip.Addr)
 	defer close(joinChan)
 
+	ndpproxy := &NDPProxy{
+		IFace: upIf,
+	}
+
 	eg, ctx := errgroup.WithContext(ctx)
+
 	eg.Go(func() error {
-		return listenMLD(ctx, ifiMLD, joinChan)
+		err := listenMLD(ctx, downIf, runAsMLDQuerier, joinChan)
+		if err != nil {
+			return fmt.Errorf("failed to listen MLD: %w", err)
+		}
+		return nil
 	})
+
+	ndpproxy.Control = func(p *ipv6.PacketConn) error {
+		eg.Go(func() error {
+			err := speakMLD(ctx, upIf, p, joinChan)
+			if err != nil {
+				return fmt.Errorf("failed to speak MLD: %w", err)
+			}
+			return nil
+		})
+		return nil
+	}
+
 	eg.Go(func() error {
-		return speakMLD(ctx, ifi, joinChan)
+		err := ndpproxy.Run(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to run NDP proxy: %w", err)
+		}
+		return nil
 	})
 
 	if err := eg.Wait(); err != nil {
@@ -62,47 +99,18 @@ func main() {
 	}
 }
 
-func findLinkLocalAddr(ifi *net.Interface) (netip.Addr, error) {
-	var lladdr netip.Addr
-
-	addrs, err := ifi.Addrs()
+func listenMLD(ctx context.Context, ifi *net.Interface, querier bool, joinChan chan netip.Addr) error {
+	lc := &net.ListenConfig{}
+	c, err := lc.ListenPacket(ctx, "ip6:ipv6-icmp", "::")
 	if err != nil {
-		return lladdr, err
-	}
-
-	for _, addr := range addrs {
-		ipnet, ok := addr.(*net.IPNet)
-		if !ok {
-			continue
-		}
-
-		addr, ok := netip.AddrFromSlice(ipnet.IP)
-		if !ok {
-			continue
-		}
-
-		if addr.IsLinkLocalUnicast() {
-			lladdr = addr.WithZone(ifi.Name)
-			return lladdr, nil
-		}
-	}
-
-	return lladdr, errors.New("no link-local address found")
-}
-
-func listenMLD(ctx context.Context, ifi *net.Interface, joinChan chan netip.Addr) error {
-	lladdr, err := findLinkLocalAddr(ifi)
-	if err != nil {
-		return fmt.Errorf("failed to find link-local address of %s: %w", ifi.Name, err)
-	}
-
-	c, err := net.ListenPacket("ip6:ipv6-icmp", lladdr.String())
-	if err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return fmt.Errorf("failed to listen ICMP6: %w", err)
 	}
 	defer c.Close()
-
 	p := ipv6.NewPacketConn(c)
+
+	if err := p.SetControlMessage(ipv6.FlagHopLimit|ipv6.FlagInterface, true); err != nil {
+		return fmt.Errorf("failed to set control message: %w", err)
+	}
 
 	filter, err := p.ICMPFilter()
 	if err != nil {
@@ -110,6 +118,7 @@ func listenMLD(ctx context.Context, ifi *net.Interface, joinChan chan netip.Addr
 	}
 
 	filter.SetAll(true)
+	filter.Accept(ipv6.ICMPTypeMulticastListenerQuery)
 	filter.Accept(ipv6.ICMPTypeMulticastListenerReport)
 	filter.Accept(ipv6.ICMPTypeMulticastListenerDone)
 	filter.Accept(ipv6.ICMPTypeVersion2MulticastListenerReport)
@@ -126,86 +135,175 @@ func listenMLD(ctx context.Context, ifi *net.Interface, joinChan chan netip.Addr
 
 	log.Printf("MLD: listen on %s", ifi.Name)
 
-	errChan := make(chan error)
-	go func() {
-		for {
-			rb := make([]byte, 1500)
-			n, _, _, err := p.ReadFrom(rb)
-			if err != nil {
-				errChan <- fmt.Errorf("failed to read from socket: %w", err)
-				return
-			}
+	eg, ctx := errgroup.WithContext(ctx)
 
-			go func() {
-				m, err := icmp6.ParseMessage(ipv6.ICMPTypeMulticastListenerReport.Protocol(), rb[:n])
+	querierCtx, cancelQuerier := context.WithCancel(ctx)
+
+	if querier {
+		eg.Go(func() error {
+			log.Printf("MLD: run as querier")
+
+			interval := 60
+			tick := time.Tick(time.Duration(interval) * time.Second)
+
+			for {
+				err := sendMLDQuery(ctx, ifi, p, interval)
 				if err != nil {
-					log.Printf("failed to parse MLD message: %v", err)
+					log.Printf("MLD: failed to send query: %v", err)
+				}
+
+				select {
+				case <-tick:
+
+				case <-querierCtx.Done():
+					return nil
+				}
+			}
+		})
+	}
+
+	eg.Go(func() error {
+		errChan := make(chan error)
+		go func() {
+			for {
+				rb := make([]byte, 1500)
+				n, rcm, srcAddr, err := p.ReadFrom(rb)
+				if err != nil {
+					errChan <- fmt.Errorf("failed to read from socket: %w", err)
 					return
 				}
 
-				switch mb := m.Body.(type) {
-				case *icmp6.MulticastListenerReport:
-					if isSolicitatedNodeMulticastAddress(mb.MulticastAddress) {
-						joinChan <- mb.MulticastAddress
+				go func() {
+					if rcm.IfIndex != ifi.Index {
+						return
 					}
-				case *icmp6.MulticastListenerDone:
-					break
-				case *icmp6.MulticastListenerReportVersion2:
-					for _, r := range mb.Records {
-						if !isSolicitatedNodeMulticastAddress(r.MulticastAddress) {
-							continue
-						}
-						switch r.Type {
-						case icmp6.MulticastAddressRecordTypeModeIsExclude:
-							if len(r.SourceAddresses) == 0 {
-								joinChan <- r.MulticastAddress
-							}
-						case icmp6.MulticastAddressRecordTypeChangeToExcludeMode:
-							if len(r.SourceAddresses) == 0 {
-								joinChan <- r.MulticastAddress
-							}
-						}
-					}
-				default:
-					break
-				}
-			}()
-		}
-	}()
 
-	select {
-	case err := <-errChan:
-		return err
-	case <-ctx.Done():
-		return nil
+					m, err := icmp6.ParseMessage(ipv6.ICMPTypeMulticastListenerReport.Protocol(), rb[:n])
+					if err != nil {
+						log.Printf("failed to parse MLD message: %v", err)
+						return
+					}
+
+					if querier && m.Type == ipv6.ICMPTypeMulticastListenerQuery {
+						srcIP := srcAddr.(*net.IPAddr)
+						src, ok := netip.AddrFromSlice(srcIP.IP)
+						if !ok {
+							return
+						}
+						if srcIP.Zone != "" {
+							src = src.WithZone(srcIP.Zone)
+						}
+
+						lladdr, err := findLinkLocalAddr(ifi)
+						if err != nil {
+							log.Printf("failed to find link local address: %v", err)
+							return
+						}
+
+						log.Printf("detect MLD querier on %s", src)
+						if src.Compare(lladdr) < 0 {
+							cancelQuerier()
+						}
+					}
+
+					switch mb := m.Body.(type) {
+					case *icmp6.MulticastListenerReport:
+						if isSolicitatedNodeMulticastAddress(mb.MulticastAddr) {
+							joinChan <- mb.MulticastAddr
+						}
+					case *icmp6.MulticastListenerDone:
+						break
+					case *icmp6.MulticastListenerReportVersion2:
+						for _, r := range mb.Records {
+							if !isSolicitatedNodeMulticastAddress(r.MulticastAddress) {
+								continue
+							}
+							switch r.Type {
+							case icmp6.MulticastAddressRecordTypeModeIsExclude:
+								if len(r.SourceAddresses) == 0 {
+									joinChan <- r.MulticastAddress
+								}
+							case icmp6.MulticastAddressRecordTypeChangeToExcludeMode:
+								if len(r.SourceAddresses) == 0 {
+									joinChan <- r.MulticastAddress
+								}
+							}
+						}
+					default:
+						break
+					}
+				}()
+			}
+		}()
+
+		select {
+		case err := <-errChan:
+			return err
+		case <-ctx.Done():
+			return nil
+		}
+	})
+
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("failed to listen MLD: %w", err)
 	}
+	return nil
 }
 
-func speakMLD(ctx context.Context, ifi *net.Interface, joinChan chan netip.Addr) error {
-	lladdr, err := findLinkLocalAddr(ifi)
-	if err != nil {
-		return fmt.Errorf("failed to find link-local address of %s: %w", ifi.Name, err)
+func sendMLDQuery(ctx context.Context, ifi *net.Interface, p *ipv6.PacketConn, interval int) error {
+	dst := netip.MustParseAddr("ff02::1").WithZone(ifi.Name)
+
+	wm := icmp.Message{
+		Type: ipv6.ICMPTypeMulticastListenerQuery,
+		Code: 0,
+		Body: &icmp6.MulticastListenerQueryVersion2{
+			MaximumResponseDelay:        10000,
+			MulticastAddr:               netip.MustParseAddr("::"),
+			SupressRouterSideProcessing: false,
+			Robustness:                  2,
+			QueryInterval:               uint(interval),
+		},
+	}
+	wcm := ipv6.ControlMessage{
+		HopLimit: 255,
 	}
 
-	c, err := net.ListenPacket("ip6:ipv6-icmp", lladdr.String())
+	wb, err := wm.Marshal(nil)
 	if err != nil {
-		return fmt.Errorf("failed to listen: %w", err)
+		return fmt.Errorf("failed to marshal MLD query: %w", err)
 	}
-	defer c.Close()
 
-	p := ipv6.NewPacketConn(c)
+	if _, err := p.WriteTo(wb, &wcm, &net.IPAddr{IP: dst.AsSlice(), Zone: dst.Zone()}); err != nil {
+		return fmt.Errorf("failed to send MLD query: %w", err)
+	}
 
+	return nil
+}
+
+func findLinkLocalAddr(ifi *net.Interface) (netip.Addr, error) {
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to get interface addresses: %w", err)
+	}
+
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.IsLinkLocalUnicast() {
+			ip, ok := netip.AddrFromSlice(ipnet.IP)
+			if !ok {
+				continue
+			}
+			ip = ip.WithZone(ifi.Name)
+			return ip, nil
+		}
+	}
+
+	return netip.Addr{}, fmt.Errorf("failed to find link local address")
+}
+
+func speakMLD(ctx context.Context, ifi *net.Interface, p *ipv6.PacketConn, joinChan chan netip.Addr) error {
 	log.Printf("MLD: speak on %s", ifi.Name)
 
 	joinedAddrs := make(map[netip.Addr]struct{})
-	defer func() {
-		for addr := range joinedAddrs {
-			group := &net.IPAddr{IP: addr.AsSlice()}
-			if err := p.LeaveGroup(ifi, group); err != nil {
-				log.Printf("failed to leave MLD multicast group: %v", err)
-			}
-		}
-	}()
 
 	for {
 		select {

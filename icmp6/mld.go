@@ -134,7 +134,7 @@ func (m *MulticastListenerQueryVersion2) Marshal(proto int) ([]byte, error) {
 	if !m.MulticastAddr.Is6() {
 		return nil, fmt.Errorf("multicast address %v is not IPv6", m.MulticastAddr)
 	}
-	if !m.MulticastAddr.IsMulticast() {
+	if !m.MulticastAddr.IsMulticast() && m.MulticastAddr.Compare(zeroAddr) != 0 {
 		return nil, fmt.Errorf("address %v is not multicast", m.MulticastAddr)
 	}
 	maddrBytes, err := m.MulticastAddr.MarshalBinary()
@@ -378,6 +378,8 @@ func parseMLDMessage(typ ipv6.ICMPType, b []byte) (icmp.MessageBody, error) {
 	}
 }
 
+var zeroAddr = netip.MustParseAddr("::")
+
 func unmarshalIPv6MulticastAddress(b []byte) (netip.Addr, error) {
 	var maddr netip.Addr
 	maddr, ok := netip.AddrFromSlice(b)
@@ -387,7 +389,7 @@ func unmarshalIPv6MulticastAddress(b []byte) (netip.Addr, error) {
 	if !maddr.Is6() || maddr.Is4In6() {
 		return maddr, fmt.Errorf("multicast address %v is not IPv6 address", maddr)
 	}
-	if !maddr.IsMulticast() {
+	if !maddr.IsMulticast() && maddr.Compare(zeroAddr) != 0 {
 		return maddr, fmt.Errorf("multicast address %v is not multicast address", maddr)
 	}
 

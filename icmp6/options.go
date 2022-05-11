@@ -149,7 +149,7 @@ func parseOptions(b []byte) (NDPOptions, error) {
 
 		typ := NDPOptionType(b[0])
 		l := int(b[1]) * 8
-		if l < 2 || l > len(b) {
+		if l < 2 {
 			return nil, errors.New("invalid option length")
 		}
 
