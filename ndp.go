@@ -9,12 +9,15 @@ import (
 
 	"github.com/tosuke/ndp-proxy/icmp6"
 	"golang.org/x/net/ipv6"
+	"golang.org/x/sync/errgroup"
 )
 
 type NDPProxy struct {
-	Control  func(p *ipv6.PacketConn) error
-	IFace    *net.Interface
-	requests map[netip.Addr]request
+	Control   func(p *ipv6.PacketConn) error
+	UpIf      *net.Interface
+	DownIf    *net.Interface
+	AddrEvent AddrEvent
+	requests  map[netip.Addr]request
 }
 
 type request struct {
@@ -23,7 +26,7 @@ type request struct {
 }
 
 func (np *NDPProxy) Run(ctx context.Context) error {
-	if np.IFace == nil {
+	if np.UpIf == nil {
 		return fmt.Errorf("no interface")
 	}
 
@@ -58,30 +61,47 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 		}
 	}
 
-	errChan := make(chan error)
-	go func() {
-		for {
-			rb := make([]byte, 1500)
-			n, rcm, src, err := p.ReadFrom(rb)
-			if err != nil {
-				errChan <- fmt.Errorf("failed to read from socket: %w", err)
-				return
-			}
+	eg, ctx := errgroup.WithContext(ctx)
 
-			go func() {
-				if err := np.handle(p, rb[:n], rcm, src); err != nil {
-					log.Printf("NDP: failed to handle ICMP6 packet: %v", err)
-				}
-			}()
+	eg.Go(func() error {
+		err := speakMLD(ctx, np.UpIf, p, np.AddrEvent)
+		if err != nil {
+			return fmt.Errorf("failed to speak MLD: %w", err)
 		}
-	}()
-
-	select {
-	case err := <-errChan:
-		return fmt.Errorf("failed to run NDPProxy: %w", err)
-	case <-ctx.Done():
 		return nil
+	})
+
+	eg.Go(func() error {
+		errChan := make(chan error)
+		go func() {
+			for {
+				rb := make([]byte, 1500)
+				n, rcm, src, err := p.ReadFrom(rb)
+				if err != nil {
+					errChan <- fmt.Errorf("failed to read from socket: %w", err)
+					return
+				}
+
+				go func() {
+					if err := np.handle(p, rb[:n], rcm, src); err != nil {
+						log.Printf("NDP: failed to handle ICMP6 packet: %v", err)
+					}
+				}()
+			}
+		}()
+
+		select {
+		case err := <-errChan:
+			return fmt.Errorf("failed to run NDPProxy: %w", err)
+		case <-ctx.Done():
+			return nil
+		}
+	})
+
+	if err := eg.Wait(); err != nil {
+		return err
 	}
+	return nil
 }
 
 func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessage, src net.Addr) error {
@@ -92,11 +112,42 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 
 	switch mb := m.Body.(type) {
 	case *icmp6.NeighborSolicitation:
-		if rcm.IfIndex != np.IFace.Index {
+		if rcm.IfIndex != np.UpIf.Index {
 			return nil
 		}
 		log.Printf("NDP: received solicitation from %s: who is %s", src, mb.TargetAddr)
 	}
 
 	return nil
+}
+
+func speakMLD(ctx context.Context, ifi *net.Interface, p *ipv6.PacketConn, ae AddrEvent) error {
+	log.Printf("MLD: speak on %s", ifi.Name)
+
+	joinedAddrs := make(map[netip.Addr]struct{})
+
+	for {
+		select {
+		case addr, ok := <-ae.Joined():
+			if !ok {
+				break
+			}
+
+			if !isSolicitatedNodeMulticastAddress(addr) {
+				continue
+			}
+
+			_, has := joinedAddrs[addr]
+			if !has {
+				group := &net.IPAddr{IP: addr.AsSlice()}
+				if err := p.JoinGroup(ifi, group); err != nil {
+					return fmt.Errorf("failed to join MLD multicast group: %w", err)
+				}
+				joinedAddrs[addr] = struct{}{}
+				log.Printf("MLD: joined %s", addr)
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }

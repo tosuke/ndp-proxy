@@ -6,6 +6,6 @@ run: ndp-proxy
 	sudo ./ndp-proxy
 
 ndp-proxy: FORCE
-	go build -o ndp-proxy main.go
+	go build -o ndp-proxy
 
 FORCE:
