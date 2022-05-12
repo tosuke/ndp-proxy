@@ -19,7 +19,7 @@ type NDPProxy struct {
 	UpIf      *net.Interface
 	DownIf    *net.Interface
 	AddrEvent AddrEvent
-	requests  map[netip.Addr]request
+	requests  requests
 }
 
 type request struct {
@@ -34,11 +34,6 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 
 	if np.UpIf == nil {
 		return fmt.Errorf("no interface")
-	}
-
-	if np.requests == nil {
-		np.requests = make(map[netip.Addr]request)
-		go handleTimeoutedRequests(ctx, np.requests)
 	}
 
 	lc := &net.ListenConfig{}
@@ -162,11 +157,12 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 		log.Printf("NDP: start to handle solicitation from %s: who is %s", src, mb.TargetAddr)
 
 		deadline := time.Now().Add(500 * time.Millisecond)
-		np.requests[mb.TargetAddr] = request{
+		req := request{
 			src:      src,
 			addr:     mb.TargetAddr,
 			deadline: deadline,
 		}
+		np.requests.AddReq(req)
 
 		srcLinkLayerAddrOption := icmp6.NDPOption{
 			Type: icmp6.NDPOptionSourceLinkLayerAddress,
@@ -204,11 +200,11 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 			return nil
 		}
 
-		req, ok := np.requests[mb.TargetAddr]
+		req, ok := np.requests.Get(mb.TargetAddr)
 		if !ok {
 			return nil
 		}
-		delete(np.requests, mb.TargetAddr)
+		np.requests.RemoveReq(req.src, req.addr)
 
 		log.Printf("NDP: handle request from %s: who is %s", req.src, req.addr)
 
@@ -277,26 +273,54 @@ func speakMLD(ctx context.Context, ifi *net.Interface, p *ipv6.PacketConn, ae Ad
 	}
 }
 
-func handleTimeoutedRequests(ctx context.Context, requests map[netip.Addr]request) {
-	now := time.Now()
-	next := now.Add(1 * time.Minute)
+type requests struct {
+	m map[netip.Addr]request
+}
 
-	for {
-		for key, req := range requests {
-			if req.deadline.Before(now) {
-				delete(requests, key)
-				continue
-			}
-			if req.deadline.Before(next) {
-				next = req.deadline
-			}
-		}
+const maxRequests = 1000
 
-		select {
-		case <-time.After(time.Until(next)):
-			continue
-		case <-ctx.Done():
-			return
+func (r requests) AddReq(req request) {
+	if r.m == nil {
+		r.m = make(map[netip.Addr]request)
+	}
+
+	if len(r.m) >= maxRequests {
+		r.gc()
+	}
+
+	if req.deadline.Before(time.Now()) {
+		r.m[req.addr] = req
+	}
+}
+
+func (r requests) RemoveReq(src netip.Addr, addr netip.Addr) {
+	if r.m == nil {
+		return
+	}
+
+	delete(r.m, addr)
+}
+
+func (r requests) Get(addr netip.Addr) (request, bool) {
+	if r.m == nil {
+		return request{}, false
+	}
+
+	req, has := r.m[addr]
+	if !has {
+		return request{}, false
+	}
+	if req.deadline.Before(time.Now()) {
+		r.RemoveReq(req.src, req.addr)
+		return request{}, false
+	}
+	return req, true
+}
+
+func (r requests) gc() {
+	for addr, req := range r.m {
+		if req.deadline.Before(time.Now()) {
+			delete(r.m, addr)
 		}
 	}
 }
