@@ -143,9 +143,6 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 				continue
 			}
 			if ipnet.IP.IsGlobalUnicast() && ipnet.Contains(target) {
-				if ipnet.IP.Equal(target) {
-					break
-				}
 				matchedIf = np.DownIf
 				break
 			}
@@ -154,7 +151,7 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 			return nil
 		}
 
-		log.Printf("NDP: start to handle solicitation from %s: who is %s", src, mb.TargetAddr)
+		log.Printf("NDP: handle  solicit from %s: who is %s", src, mb.TargetAddr)
 
 		deadline := time.Now().Add(2 * time.Second)
 		req := request{
@@ -206,7 +203,7 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 		}
 		np.requests.Remove(req.src, req.addr)
 
-		log.Printf("NDP: handle request from %s: who is %s", req.src, req.addr)
+		log.Printf("NDP: respond solicit from %s: who is %s", req.src, req.addr)
 
 		targetLLAddrOption := icmp6.NDPOption{
 			Type: icmp6.NDPOptionTargetLinkLayerAddress,
