@@ -198,8 +198,8 @@ func listenMLD(ctx context.Context, ifi *net.Interface, querier bool, ac AddrCol
 						return
 					}
 
-					log.Printf("detect MLD querier on %s", src)
 					if src.Compare(lladdr) < 0 {
+						log.Printf("MLD: detect MLD querier with high priority on %s, stop querier", src)
 						cancelQuerier()
 					}
 				}
