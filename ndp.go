@@ -156,13 +156,13 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 
 		log.Printf("NDP: start to handle solicitation from %s: who is %s", src, mb.TargetAddr)
 
-		deadline := time.Now().Add(500 * time.Millisecond)
+		deadline := time.Now().Add(2 * time.Second)
 		req := request{
 			src:      src,
 			addr:     mb.TargetAddr,
 			deadline: deadline,
 		}
-		np.requests.AddReq(req)
+		np.requests.Add(req)
 
 		srcLinkLayerAddrOption := icmp6.NDPOption{
 			Type: icmp6.NDPOptionSourceLinkLayerAddress,
@@ -200,11 +200,11 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 			return nil
 		}
 
-		req, ok := np.requests.Get(mb.TargetAddr)
-		if !ok {
+		req, has := np.requests.Get(mb.TargetAddr)
+		if !has {
 			return nil
 		}
-		np.requests.RemoveReq(req.src, req.addr)
+		np.requests.Remove(req.src, req.addr)
 
 		log.Printf("NDP: handle request from %s: who is %s", req.src, req.addr)
 
@@ -279,7 +279,7 @@ type requests struct {
 
 const maxRequests = 1000
 
-func (r requests) AddReq(req request) {
+func (r *requests) Add(req request) {
 	if r.m == nil {
 		r.m = make(map[netip.Addr]request)
 	}
@@ -288,12 +288,12 @@ func (r requests) AddReq(req request) {
 		r.gc()
 	}
 
-	if req.deadline.Before(time.Now()) {
+	if req.deadline.After(time.Now()) {
 		r.m[req.addr] = req
 	}
 }
 
-func (r requests) RemoveReq(src netip.Addr, addr netip.Addr) {
+func (r *requests) Remove(src netip.Addr, addr netip.Addr) {
 	if r.m == nil {
 		return
 	}
@@ -301,7 +301,7 @@ func (r requests) RemoveReq(src netip.Addr, addr netip.Addr) {
 	delete(r.m, addr)
 }
 
-func (r requests) Get(addr netip.Addr) (request, bool) {
+func (r *requests) Get(addr netip.Addr) (request, bool) {
 	if r.m == nil {
 		return request{}, false
 	}
@@ -311,13 +311,13 @@ func (r requests) Get(addr netip.Addr) (request, bool) {
 		return request{}, false
 	}
 	if req.deadline.Before(time.Now()) {
-		r.RemoveReq(req.src, req.addr)
+		r.Remove(req.src, req.addr)
 		return request{}, false
 	}
 	return req, true
 }
 
-func (r requests) gc() {
+func (r *requests) gc() {
 	for addr, req := range r.m {
 		if req.deadline.Before(time.Now()) {
 			delete(r.m, addr)
