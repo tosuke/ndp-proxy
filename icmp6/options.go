@@ -133,9 +133,12 @@ func parseLinkLayerAddressOption(typ NDPOptionType, b []byte) (NDPOptionBody, er
 
 	hwa := net.HardwareAddr(ab)
 
-	if typ == NDPOptionSourceLinkLayerAddress {
-		return &SourceLinkLayerAddress{HardwareAddr: hwa}, nil
-	} else {
+	switch typ {
+	case NDPOptionSourceLinkLayerAddress:
+		return &SourceLinkLayerAddress{hwa}, nil
+	case NDPOptionTargetLinkLayerAddress:
+		return &TargetLinkLayerAddress{hwa}, nil
+	default:
 		return nil, errInvalidOptionType
 	}
 }

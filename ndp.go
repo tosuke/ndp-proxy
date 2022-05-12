@@ -6,8 +6,10 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"time"
 
 	"github.com/tosuke/ndp-proxy/icmp6"
+	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sync/errgroup"
 )
@@ -21,8 +23,9 @@ type NDPProxy struct {
 }
 
 type request struct {
-	addr netip.Addr
-	src  net.Addr
+	addr     netip.Addr
+	src      netip.Addr
+	deadline time.Time
 }
 
 func (np *NDPProxy) Run(ctx context.Context) error {
@@ -35,6 +38,7 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 
 	if np.requests == nil {
 		np.requests = make(map[netip.Addr]request)
+		go handleTimeoutedRequests(ctx, np.requests)
 	}
 
 	lc := &net.ListenConfig{}
@@ -104,10 +108,22 @@ func (np *NDPProxy) Run(ctx context.Context) error {
 	return nil
 }
 
-func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessage, src net.Addr) error {
+func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessage, srcAddr net.Addr) error {
 	m, err := icmp6.ParseMessage(ipv6.ICMPTypeEchoReply.Protocol(), rb)
 	if err != nil {
 		return fmt.Errorf("failed to parse ICMP6 message: %w", err)
+	}
+
+	srcIPAddr, ok := srcAddr.(*net.IPAddr)
+	if !ok {
+		return fmt.Errorf("invalid source address type: %v", srcAddr)
+	}
+	src, ok := netip.AddrFromSlice(srcIPAddr.IP)
+	if !ok {
+		return fmt.Errorf("invalid source address: %v", srcIPAddr)
+	}
+	if srcIPAddr.Zone != "" {
+		src = src.WithZone(srcIPAddr.Zone)
 	}
 
 	switch mb := m.Body.(type) {
@@ -115,7 +131,116 @@ func (np *NDPProxy) handle(p *ipv6.PacketConn, rb []byte, rcm *ipv6.ControlMessa
 		if rcm.IfIndex != np.UpIf.Index {
 			return nil
 		}
-		log.Printf("NDP: received solicitation from %s: who is %s", src, mb.TargetAddr)
+		if !mb.TargetAddr.IsGlobalUnicast() || !mb.TargetAddr.Is6() {
+			return nil
+		}
+
+		target := mb.TargetAddr.AsSlice()
+		var matchedIf *net.Interface
+		addrs, err := np.DownIf.Addrs()
+		if err != nil {
+			return fmt.Errorf("failed to get interface addresses: %w", err)
+		}
+
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			if ipnet.IP.IsGlobalUnicast() && ipnet.Contains(target) {
+				if ipnet.IP.Equal(target) {
+					break
+				}
+				matchedIf = np.DownIf
+				break
+			}
+		}
+		if matchedIf == nil {
+			return nil
+		}
+
+		log.Printf("NDP: start to handle solicitation from %s: who is %s", src, mb.TargetAddr)
+
+		deadline := time.Now().Add(500 * time.Millisecond)
+		np.requests[mb.TargetAddr] = request{
+			src:      src,
+			addr:     mb.TargetAddr,
+			deadline: deadline,
+		}
+
+		srcLinkLayerAddrOption := icmp6.NDPOption{
+			Type: icmp6.NDPOptionSourceLinkLayerAddress,
+			Body: &icmp6.SourceLinkLayerAddress{
+				HardwareAddr: matchedIf.HardwareAddr,
+			},
+		}
+
+		wm := icmp.Message{
+			Type: ipv6.ICMPTypeNeighborSolicitation,
+			Code: 0,
+			Body: &icmp6.NeighborSolicitation{
+				TargetAddr: mb.TargetAddr,
+				Options:    []icmp6.NDPOption{srcLinkLayerAddrOption},
+			},
+		}
+		wcm := ipv6.ControlMessage{
+			HopLimit: 255,
+		}
+
+		wb, err := wm.Marshal(nil)
+		if err != nil {
+			return fmt.Errorf("failed to marshal NS message: %w", err)
+		}
+
+		dst := net.ParseIP("ff02::1:ff00:0")
+		copy(dst[13:16], target[13:16])
+
+		if _, err := p.WriteTo(wb, &wcm, &net.IPAddr{IP: dst, Zone: matchedIf.Name}); err != nil {
+			return fmt.Errorf("failed to write NS message: %w", err)
+		}
+
+	case *icmp6.NeighborAdvertisement:
+		if rcm.IfIndex != np.DownIf.Index {
+			return nil
+		}
+
+		req, ok := np.requests[mb.TargetAddr]
+		if !ok {
+			return nil
+		}
+		delete(np.requests, mb.TargetAddr)
+
+		log.Printf("NDP: handle request from %s: who is %s", req.src, req.addr)
+
+		targetLLAddrOption := icmp6.NDPOption{
+			Type: icmp6.NDPOptionTargetLinkLayerAddress,
+			Body: &icmp6.TargetLinkLayerAddress{
+				HardwareAddr: np.UpIf.HardwareAddr,
+			},
+		}
+		wm := icmp.Message{
+			Type: ipv6.ICMPTypeNeighborAdvertisement,
+			Code: 0,
+			Body: &icmp6.NeighborAdvertisement{
+				TargetAddr:    mb.TargetAddr,
+				RouterFlag:    false,
+				SolicitedFlag: mb.SolicitedFlag,
+				OverrideFlag:  mb.OverrideFlag,
+				Options:       []icmp6.NDPOption{targetLLAddrOption},
+			},
+		}
+		wcm := ipv6.ControlMessage{
+			HopLimit: 255,
+		}
+
+		wb, err := wm.Marshal(nil)
+		if err != nil {
+			return fmt.Errorf("failed to marshal NA message: %w", err)
+		}
+
+		if _, err := p.WriteTo(wb, &wcm, &net.IPAddr{IP: req.src.AsSlice(), Zone: req.src.Zone()}); err != nil {
+			return fmt.Errorf("failed to write NA message: %w", err)
+		}
 	}
 
 	return nil
@@ -148,6 +273,30 @@ func speakMLD(ctx context.Context, ifi *net.Interface, p *ipv6.PacketConn, ae Ad
 			}
 		case <-ctx.Done():
 			return nil
+		}
+	}
+}
+
+func handleTimeoutedRequests(ctx context.Context, requests map[netip.Addr]request) {
+	now := time.Now()
+	next := now.Add(1 * time.Minute)
+
+	for {
+		for key, req := range requests {
+			if req.deadline.Before(now) {
+				delete(requests, key)
+				continue
+			}
+			if req.deadline.Before(next) {
+				next = req.deadline
+			}
+		}
+
+		select {
+		case <-time.After(time.Until(next)):
+			continue
+		case <-ctx.Done():
+			return
 		}
 	}
 }
