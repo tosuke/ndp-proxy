@@ -1,0 +1,4 @@
+#/bin/bash
+
+go run github.com/tinynetwork/tinet@v0.0.3 $@ \
+| perl -pe 's/ovs-vsctl add-br ([\w-]+)/ip link add $1 type bridge mcast_snooping 1/; s/ovs-vsctl del-br ([\w-]+)/ip link del $1/; s/ovs-vsctl add-port ([\w-]+) ([\w-]+)/ip link set dev $2 master $1/g'
